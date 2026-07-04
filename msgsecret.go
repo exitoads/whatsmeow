@@ -109,18 +109,33 @@ func (cli *Client) decryptMsgSecret(ctx context.Context, msg *events.Message, us
 	if baseEncKey == nil {
 		return nil, ErrOriginalMessageSecretNotFound
 	}
-	secretKey, additionalData := generateMsgSecretKey(useCase, msg.Info.Sender, origMsgKey.GetID(), origSender, baseEncKey)
-	plaintext, err := gcmutil.Decrypt(secretKey, encrypted.GetEncIV(), encrypted.GetEncPayload(), additionalData)
-	if err != nil {
-		// Hack for trying both the original sender in the new message and the one who we received the secret key from.
-		// This will hopefully become unnecessary when WhatsApp fully finishes their migration to LIDs.
-		if origSender != storedOrigSender && strings.Contains(err.Error(), "message authentication failed") {
-			secretKey, additionalData = generateMsgSecretKey(useCase, msg.Info.Sender, origMsgKey.GetID(), storedOrigSender, baseEncKey)
-			plaintext, err = gcmutil.Decrypt(secretKey, encrypted.GetEncIV(), encrypted.GetEncPayload(), additionalData)
+	modificationSenders := []types.JID{msg.Info.Sender}
+	if !msg.Info.SenderAlt.IsEmpty() && msg.Info.SenderAlt.ToNonAD() != msg.Info.Sender.ToNonAD() {
+		modificationSenders = append(modificationSenders, msg.Info.SenderAlt)
+	}
+	origSenders := []types.JID{origSender}
+	// Hack for trying both the original sender in the new message and the one who we received the secret key from.
+	// This will hopefully become unnecessary when WhatsApp fully finishes their migration to LIDs.
+	if origSender != storedOrigSender {
+		origSenders = append(origSenders, storedOrigSender)
+	}
+
+	var plaintext []byte
+	var lastErr error
+	for _, modificationSender := range modificationSenders {
+		for _, candidateOrigSender := range origSenders {
+			secretKey, additionalData := generateMsgSecretKey(useCase, modificationSender, origMsgKey.GetID(), candidateOrigSender, baseEncKey)
+			plaintext, lastErr = gcmutil.Decrypt(secretKey, encrypted.GetEncIV(), encrypted.GetEncPayload(), additionalData)
+			if lastErr == nil {
+				return plaintext, nil
+			}
+			if !strings.Contains(lastErr.Error(), "message authentication failed") {
+				return nil, fmt.Errorf("failed to decrypt secret message: %w", lastErr)
+			}
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt secret message: %w", err)
-		}
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to decrypt secret message: %w", lastErr)
 	}
 	return plaintext, nil
 }
